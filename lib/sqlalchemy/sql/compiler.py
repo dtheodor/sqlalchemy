@@ -28,6 +28,7 @@ from . import schema, sqltypes, operators, functions, \
 from .. import util, exc
 import decimal
 import itertools
+import operator
 
 RESERVED_WORDS = set([
     'all', 'analyse', 'analyze', 'and', 'any', 'array',
@@ -1869,12 +1870,41 @@ class SQLCompiler(Compiled):
         else:
             stmt_parameters = stmt.parameters
 
+        if extra_tables:
+            # when extra tables are present, refer to the columns
+            # in those extra tables as table-qualified, including in
+            # dictionaries and when rendering bind param names.
+            # the "main" table of the statement remains unqualified,
+            # allowing the most compatibility with a non-multi-table
+            # statement.
+            _et = set(extra_tables)
+            def _column_as_key(key):
+                str_key = elements._column_as_key(key)
+                if hasattr(key, 'table') and key.table in _et:
+                    return (key.table.name, str_key)
+                else:
+                    return str_key
+            def _getattr_col_key(col):
+                if col.table in _et:
+                    return (col.table.name, col.key)
+                else:
+                    return col.key
+            def _col_bind_name(col):
+                if col.table in _et:
+                    return "%s_%s" % (col.table.name, col.key)
+                else:
+                    return col.key
+
+        else:
+            _column_as_key = elements._column_as_key
+            _getattr_col_key = _col_bind_name = operator.attrgetter("key")
+
         # if we have statement parameters - set defaults in the
         # compiled params
         if self.column_keys is None:
             parameters = {}
         else:
-            parameters = dict((elements._column_as_key(key), REQUIRED)
+            parameters = dict((_column_as_key(key), REQUIRED)
                               for key in self.column_keys
                               if not stmt_parameters or
                               key not in stmt_parameters)
@@ -1882,9 +1912,12 @@ class SQLCompiler(Compiled):
         # create a list of column assignment clauses as tuples
         values = []
 
+        if self.isupdate:
+            import pdb
+            pdb.set_trace()
         if stmt_parameters is not None:
             for k, v in stmt_parameters.items():
-                colkey = elements._column_as_key(k)
+                colkey = _column_as_key(k)
                 if colkey is not None:
                     parameters.setdefault(colkey, v)
                 else:
@@ -1935,11 +1968,12 @@ class SQLCompiler(Compiled):
                 for c in t.c:
                     if c in normalized_params:
                         affected_tables.add(t)
-                        check_columns[c.key] = c
+                        check_columns[(c.table.name, c.key)] = c
                         value = normalized_params[c]
                         if elements._is_literal(value):
                             value = self._create_crud_bind_param(
-                                c, value, required=value is REQUIRED)
+                                c, value, required=value is REQUIRED,
+                                name=_col_bind_name(c))
                         else:
                             self.postfetch.append(c)
                             value = self.process(value.self_group(), **kw)
@@ -1959,7 +1993,7 @@ class SQLCompiler(Compiled):
                             self.postfetch.append(c)
                         else:
                             values.append(
-                                (c, self._create_crud_bind_param(c, None))
+                                (c, self._create_crud_bind_param(c, None, name=_col_bind_name(c)))
                             )
                             self.prefetch.append(c)
                     elif c.server_onupdate is not None:
@@ -1968,7 +2002,7 @@ class SQLCompiler(Compiled):
         if self.isinsert and stmt.select_names:
             # for an insert from select, we can only use names that
             # are given, so only select for those names.
-            cols = (stmt.table.c[elements._column_as_key(name)]
+            cols = (stmt.table.c[_column_as_key(name)]
                         for name in stmt.select_names)
         else:
             # iterate through all table columns to maintain
@@ -1976,14 +2010,15 @@ class SQLCompiler(Compiled):
             cols = stmt.table.columns
 
         for c in cols:
-            if c.key in parameters and c.key not in check_columns:
-                value = parameters.pop(c.key)
+            col_key = _getattr_col_key(c)
+            if col_key in parameters and col_key not in check_columns:
+                value = parameters.pop(col_key)
                 if elements._is_literal(value):
                     value = self._create_crud_bind_param(
                                     c, value, required=value is REQUIRED,
-                                    name=c.key
+                                    name=_col_bind_name(c)
                                         if not stmt._has_multi_parameters
-                                        else "%s_0" % c.key
+                                        else "%s_0" % _col_bind_name(c)
                                     )
                 else:
                     if isinstance(value, elements.BindParameter) and \
@@ -2119,12 +2154,12 @@ class SQLCompiler(Compiled):
 
         if parameters and stmt_parameters:
             check = set(parameters).intersection(
-                elements._column_as_key(k) for k in stmt.parameters
+                _column_as_key(k) for k in stmt.parameters
             ).difference(check_columns)
             if check:
                 raise exc.CompileError(
                     "Unconsumed column names: %s" %
-                    (", ".join(check))
+                    (", ".join("%s.%s" % c for c in check))
                 )
 
         if stmt._has_multi_parameters:
